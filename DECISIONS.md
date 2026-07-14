@@ -118,6 +118,12 @@ Fees attach to **ramps** — the points where money changes rails and units, i.e
 **Decision.** Assume we build them (the overview is the instruction document; the glossary describes the end state). All mock shapes in DESIGN §7 are therefore previews. If a later brief ships Kira's own mocks, the provider port absorbs them as two adapters — which is the point of the port.
 **Consequences.** Worst case, the invented shapes get thrown away and only the adapters are rewritten; the orchestrator and ledger don't move.
 
+## ADR-019 · Day 2 brief confirmations (2026-07-14)
+
+**Context.** The Day 2 brief arrived: finalize the design (vendor abstraction, boundaries, crash-consistency, precise idempotency keys, recon-as-query, named trade-offs) — build starts Day 3.
+**Decision.** No reversals needed: the Day 1 skeleton already carried seams for all four focus areas; Day 2 deepened them in DESIGN §7–§10 rather than redesigning. Two updates to prior entries: (a) the brief's phrasing "*two mock fiat providers … must sit behind one interface*" reads as an instruction to us — **ADR-018's call (we build the mocks) stands**, shapes still marked preview until/unless a later brief ships Kira's own; (b) ADR-015 (stack) stays provisional until the first build commit lands on Day 3.
+**Consequences.** Deliverable 1 closes with this push. The riskiest unknowns are now operational, not design: testnet faucets/RPCs, and whatever Day 3 adds. Per the Day 2 note, no feedback until after Deliverable 2 — the design is committed as-is and the build will run with it.
+
 ## Brief errata noticed (recorded, not blocking)
 
 - Glossary defines "**dReorg** (reorganization)" — the term of art is simply **reorg** / chain reorganization; treated as a typo (possibly a planted one) and not propagated into these documents.
