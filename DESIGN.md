@@ -1,6 +1,6 @@
 # DESIGN.md — Kira Ledger & Orchestration Engine
 
-> Day 1 scope: the business problem, the domain model, the ledger design, and where money can race.
+> Deliverable 1 (Days 1–2): the business problem, the domain model, the ledger design, where money can race — and, per the Day 2 brief, the boundaries, the vendor abstraction, crash-consistency, reconciliation, and the named trade-offs. A teammate should be able to build from this without asking me anything; a reviewer should understand the invariants without any code.
 > Open questions and assumptions live in [DECISIONS.md](DECISIONS.md). No code yet — on purpose.
 
 *Where I lean on experience: I work on payment orchestration at Yuno — normalizing many PSPs with genuinely different shapes behind one API — and previously on consumer fintech at RappiPay. I'll flag the calls that come from having operated these things, not just read about them.*
@@ -61,7 +61,8 @@ UI implication for Days 3–4: **one app, an Ops view first** (it's what the eva
 **Revenue/expense**: `revenue:platform_fee`, `revenue:passthrough_recovery` / `expense:provider_fees`, and `equity:rounding_residual` — rounding dust and peg slippage are absorbed by the house in an *explicit, observable* account. If it grows abnormally, we have a conversion bug and we can see it.
 
 **System**:
-- `conversion:{asset}` — paired conversion (trading) accounts, one per asset, that join single-asset legs of a cross-asset transaction at an explicit rate. The pair opens when a deposit is detected and closes when its ramp settles — **a nonzero conversion balance *is* money mid-conversion (or a rate bug)**, visible by query. (Every ledger transaction already nets to zero on its own — no "world" counter-account is needed for balancing; the outside world shows up as assets and liabilities moving in lockstep.)
+- `conversion:{asset}` — paired conversion (trading) accounts, one per asset, that join single-asset legs of a cross-asset transaction at an explicit rate. On the off-ramp the pair opens at deposit detection (T1) and closes at ramp settlement (T3); on the on-ramp it opens and closes within the payout settlement (T5). Either way: **a nonzero aged conversion balance *is* money mid-conversion (or a rate bug)**, visible by query. (Every ledger transaction already nets to zero on its own — no "world" counter-account is needed for balancing; the outside world shows up as assets and liabilities moving in lockstep.)
+- `suspense:recon` — where reconciliation corrections post while an exception is being classified (§9): an orphaned external movement is booked here first, then reclassified with a further compensating pair once ops resolves it. Never a silent write-off.
 - `asset:receivable:{client}` / `expense:reorg_loss` — where a post-threshold reorg clawback lands when the client's available can't cover it (§6 R8).
 
 ### 4.2 Structural rules
@@ -78,8 +79,11 @@ UI implication for Days 3–4: **one app, an Ops view first** (it's what the eva
 assets(id, symbol, chain, decimals)                     -- 'USDC.solana' → 6; decimals are config
 clients(id, name, parent_id)                            -- parent_id NULL = Client, else Sub-Client
 accounts(id, client_id, kind, asset_id)                 -- kind: client|sub_client|chain_inbound|
-                                                        --  fee_revenue|transit|external|...
-ledger_transactions(id, type, transfer_id, external_ref, created_at)
+                                                        --  fee_revenue|transit|conversion|suspense|...
+ledger_transactions(id, type, transfer_id,
+                    external_source, external_ref,      -- e.g. ('solana', '{tx_hash}:{ix}'),
+                    created_at)                         --  ('acmepay', '{provider_ref}') — refs
+                                                        --  are only unique per source (§9)
 ledger_entries(id, transaction_id, account_id, asset_id,
                bucket,                                  -- pending | available | hold
                amount_minor,                            -- signed BIGINT, ≠ 0; the sign IS the
@@ -92,7 +96,8 @@ transfer_events(id, transfer_id, from_status, to_status, detail, created_at)
 routes(id, account_id, match, active) / route_actions(route_id, seq, action)
 route_executions(id, route_id, trigger_transfer_id, status,
                  UNIQUE(route_id, trigger_transfer_id)) -- a route fires ONCE per deposit
-fee_schedules(client_id, platform_bps, fixed_minor, markup_bps)
+fee_schedules(client_id, rail, platform_bps, fixed_minor, markup_bps,
+              UNIQUE(client_id, rail))                  -- per-rail from day one: ACH row = zeros
 fee_applications(transfer_id, fee_type, amount_minor, ledger_transaction_id,
                  UNIQUE(transfer_id, fee_type))         -- fees can't double-apply on retry
 idempotency_keys(scope, key, request_hash, response, status, PK(scope,key))
@@ -104,6 +109,11 @@ spend_guards(account_id, asset_id, bucket,
              headroom_minor CHECK (>= 0))               -- concurrency reservation counter, NOT a
                                                         --  balance: rebuildable from SUM(entries)
                                                         --  at any time; see §6 R5
+chain_cursors(chain, last_processed_ref, updated_at)    -- watcher resume point; re-scan overlaps
+external_truth(id, source, external_id, amount_minor,   -- ingested statements & chain scans,
+               observed_at)                             --  append-only; recon input (§9)
+recon_exceptions(id, kind, source, external_id,         -- kind: settled_no_entry |
+                 transfer_id, status, created_at)       --  entry_never_confirmed; append-only
 ```
 
 `external_ref` (tx hash / provider ref) on every ledger transaction is what turns end-of-day reconciliation into two anti-joins — it exists from day 1 precisely so recon is a query, not a project.
@@ -205,16 +215,167 @@ The rule behind every guardrail: **the invariant lives in Postgres, where it can
 | R8 | Reorg | Before threshold: compensate pending (structurally no loss — pending is unspendable). After threshold + spent: with Solana at `finalized` this is essentially precluded — the post-threshold path exists for probabilistic-finality chains (Polygon's N-block threshold) and as defense-in-depth. Handling: claw back the client's *remaining* available and book any shortfall to `asset:receivable:{client}` (write-off to `expense:reorg_loss` only if uncollectable). The `CHECK (≥ 0)` guard is **never** bypassed — client books never go negative; the hole has a named owner instead (DECISIONS #10) |
 | R9 | API caller retries `POST /transfers` | `idempotency_keys` insert-first: replay same key+body → stored response; same key, different body → 422; in-flight → 409 |
 
-## 7. Architecture boundaries & extensibility
+## 7. System boundaries: API / domain / workers
 
-A **modular monolith on Postgres** — every critical invariant is a Postgres guarantee (constraint, unique index, transaction, row lock), not distributed-systems discipline. One process (web + worker), communicating through the database: outbox as the queue (`FOR UPDATE SKIP LOCKED`), guarded updates as the state machine.
+A **modular monolith on Postgres** — every critical invariant is a Postgres guarantee (constraint, unique index, transaction, row lock), not distributed-systems discipline. One deployable (web + worker loops), communicating through the database: outbox as the queue (`FOR UPDATE SKIP LOCKED`), guarded updates as the state machine.
 
-- **Ledger Core** — the *only* module that writes `ledger_entries`. One door for money.
-- **Chain Gateway (port)** — two implementations per chain: *real* (Solana devnet / Polygon Amoy, polling watchers with persisted cursors — restart-safe, dedupe makes re-scan harmless) and a *simulator* (deterministic demos, reorg injection, CI without faucets). The simulator doesn't replace the real leg; it exists because money systems must be tested against failures you can't provoke on demand.
-- **Fiat Provider port** — `createPayout(clientReference, …)`, `getPayout(ref)`, `verifyWebhook(raw)`; canonical domain states and a retryable/terminal error taxonomy. This is my day job at Yuno: the port must speak *domain*, never leak a provider's vocabulary upward, and every provider eventually delivers a duplicate or out-of-order webhook — dedupe is not optional. Two deliberately different mocks (shapes are a preview, to be confirmed when the fiat brief lands — see DECISIONS #18): *AcmePay* (async, 202 + signed webhooks with duplicates and disorder built in, amounts in cents) and *LegacyBank* (sync accept + polling, no webhooks, `"4200.00"` string amounts, ACH-style return codes). The orchestrator can't tell them apart; the same test suite runs against both — that's the proof the abstraction is real. A third provider is a new adapter behind the *existing* port plus a config row — no rewrite of the ledger core or the orchestrator, which is the glossary's actual bar.
-- **Recon worker** — EOD job (also trigger-by-endpoint for demos): two anti-joins per mirror account. External txs with no ledger entry ⇒ *settled-with-no-entry*; in-transit entries past SLA with no external confirmation ⇒ *entry-never-confirmed*. Plus the solvency check: Σ client liabilities ≤ Σ mirror assets.
+```
+                     ┌──────────────────────────────────────────────────┐
+  Ops / Client UI ──▶│ API layer (HTTP)                                 │
+                     │ Idempotency-Key middleware · webhook endpoints   │
+                     │ (verify sig → persist event → 200, process async)│
+                     └────────────────────┬─────────────────────────────┘
+                                          │ in-process calls
+                     ┌────────────────────▼─────────────────────────────┐
+                     │ Domain core (pure, no I/O)                       │
+                     │ Money · fee engine · transfer state machines ·   │
+                     │ route evaluation · **Ledger Core** — the ONLY    │
+                     │ module that writes ledger_entries. One door.     │
+                     └────────────────────┬─────────────────────────────┘
+                                          │ SQL transactions
+                     ┌────────────────────▼─────────────────────────────┐
+                     │ Postgres — source of truth AND coordinator       │
+                     │ ledger · transfers · outbox · webhook_events ·   │
+                     │ idempotency_keys · spend_guards · chain_cursors  │
+                     └────────────────────┬─────────────────────────────┘
+                                          │ claim work (SKIP LOCKED)
+                     ┌────────────────────▼─────────────────────────────┐
+                     │ Workers (same deployable, separate loops)        │
+                     │ outbox dispatcher · chain watchers · confirmation│
+                     │ tracker · poller (LegacyBank) · recon job        │
+                     └─────────┬───────────────────────┬────────────────┘
+                               │ FiatProvider port     │ ChainGateway port
+                     ┌─────────▼──────────┐  ┌─────────▼──────────────┐
+                     │ AcmePay (mock)     │  │ Solana devnet · Polygon│
+                     │ LegacyBank (mock)  │  │ Amoy · simulator       │
+                     └────────────────────┘  └────────────────────────┘
+```
 
-## 8. What I'm deliberately not doing (and why)
+Two boundary rules make the whole thing reason-about-able:
+
+1. **The API layer never talks to a provider or a chain.** It validates, posts ledger transactions, and enqueues outbox rows — all in one DB transaction. Only workers cross the system boundary, and only by draining the outbox. This is what makes the crash window (§8) tractable: intent is always durable before any external call.
+2. **The domain core does no I/O.** Money math, fee computation, state-transition legality, and route evaluation are pure functions — testable without a database, reusable from API and workers alike.
+
+### 7.1 The vendor abstraction — provider #3 as a config change
+
+The port speaks *domain*, never a provider's vocabulary (my day job at Yuno is exactly this — normalizing PSPs with genuinely different shapes behind one API — and the lesson is that any provider concept that leaks upward becomes a rewrite later):
+
+```
+FiatPayoutProvider:
+  name: string                                      # registry key
+  createPayout({ clientReference,                   # deterministic: payout:{transfer_id}
+                 amountCents, currency,             # canonical units — adapters translate
+                 counterparty, rail })
+    → { providerRef?, status: CanonicalStatus }
+  getPayout({ clientReference } | { providerRef })  # ALWAYS implemented — recovery (§8)
+    → { status: CanonicalStatus, failureReason? }   #  and recon (§9) depend on it
+  verifyWebhook(rawBody, headers)                   # only for push providers; poll providers
+    → DomainEvent | invalid(reason)                 #  get a poller that synthesizes the same
+                                                    #  DomainEvents — one path downstream
+```
+
+**Canonical states and the two mock shapes** (previews — see DECISIONS #18/#19):
+
+| Canonical | *AcmePay* (async, push) | *LegacyBank* (sync accept, poll) |
+|---|---|---|
+| `initiated` | `202 {status:"pending"}` | `{"sts":"ACCEPTED"}` |
+| `processing` | webhook `processing` | poll `IN_TRANSIT` |
+| `settled` | webhook `completed` | poll `SETTLED` |
+| `failed` (terminal) | webhook `rejected` + code | return codes `R01…` |
+| `returned` (late) | webhook `reversed` | poll `RETURNED` |
+| amounts | integer cents | string `"4200.00"` |
+| dedupe | by `client_reference` | by `client_reference` |
+
+Canonical states map 1:1 onto the §5 outbound machine: `initiated` = the ack that moves `funds_held → submitted`; `processing` drives `submitted → pending_settlement`; `settled`, `failed`, and `returned` drive their like-named transitions (a `failed` triggers `funds_released`; a late `returned` posts its compensating pair).
+
+Adapters translate three things: units (string dollars ↔ cents), status vocabulary (mapped to canonical states above), and error taxonomy (**retryable vs terminal** — the only distinction the orchestrator needs). AcmePay's mock deliberately delivers duplicate and out-of-order webhooks; LegacyBank deliberately has transient timeouts. That's not sadism — it's the test harness for §8.
+
+**Why provider #3 is a config change:** providers register in a config-driven registry (`rail → provider name → adapter + credentials + notification strategy`). Adding *FastACH Inc.* means implementing the 3-method port (a mock adapter is ~50 lines) and adding one config entry. The ledger core, orchestrator, recon, and UI don't change — they never knew provider names, only canonical states. The proof is mechanical: **one parameterized contract-test suite runs against every registered adapter**; a new adapter passes the same suite or doesn't ship. (This is also my prepared Day 5 live-change.)
+
+### 7.2 The chain gateway
+
+Same port philosophy for chains: `watchDeposits(cursor)`, `getConfirmations(txRef)`, `sendToken(…)` with two implementations per chain — *real* (Solana devnet / Polygon Amoy: polling watchers with persisted cursors and overlap re-scan; restart-safe because dedupe by `(chain, tx_hash, instruction_index)` makes re-scanning harmless) and a *simulator* (deterministic demos, reorg injection, CI without faucets). The simulator doesn't replace the real leg; it exists because money systems must be tested against failures you can't provoke on demand — you cannot order a reorg from devnet.
+
+## 8. Failure & crash-consistency
+
+**The crash window, named:** the process can die between the ledger write and the provider call — or between the provider call and recording its result. Order matters, so the rule is fixed: **ledger first, always; never HTTP inside a DB transaction.** Intent is committed atomically (hold entries + transfer + outbox row with a deterministic `provider_idem_key = payout:{transfer_id}`), then a dispatcher makes the external call. Walking every crash point of an outbound payout:
+
+| # | Crash point | What exists | Recovery |
+|---|---|---|---|
+| C1 | Before the hold transaction commits | Nothing — atomicity | Caller retries with the same `Idempotency-Key` → clean re-execution |
+| C2 | After commit, before dispatcher claims | Hold + outbox `pending` | Next dispatcher loop claims it. No special case |
+| C3 | Dispatcher called provider, died before recording the ack | Outbox `in_flight`, provider *may* know the payout | Recovery sweep: any `in_flight` older than T → **`getPayout(clientReference)` first**. Provider knows it → record ack and move on. Provider doesn't → re-send with the *same* `clientReference`; the provider dedupes. Never a blind retry |
+| C4 | Provider settled, webhook lost / never delivered | Transfer aged in `pending_settlement` | The poller (LegacyBank) or an aged-state sweep (AcmePay) calls `getPayout`; recon (§9) is the final backstop — this is exactly an *entry-never-confirmed* |
+| C5 | Webhook received, crash before processing | Event persisted (insert-first, `PK(provider, event_id)`) | Events are processed async from the persisted row; provider redelivery is a keyed no-op |
+
+Inbound is symmetric and simpler: the watcher's cursor is persisted, restart re-scans with overlap, and `(chain, tx_hash, instruction_index)` makes every re-scan idempotent. For outbound crypto, intent = the signed transaction persisted before broadcast; recovery queries by signature, and re-signs only after the blockhash window (~150 slots ≈ 60s) has expired (DECISIONS #12).
+
+**Idempotency keys, precisely** (every dedupe is a Postgres row — none lives in process memory):
+
+| Surface | Key | Mechanism | On replay |
+|---|---|---|---|
+| Inbound crypto deposit | `(chain, tx_hash, instruction_index)` | `UNIQUE` + `ON CONFLICT DO NOTHING` | Silent no-op; only the winning insert posts entries |
+| Public API (create transfer/payout) | `Idempotency-Key` header, scoped per route + account | `PK(scope, key)` insert-first; stores `request_hash` + response | Same key+body → stored response. Same key, different body → `422`. In flight → `409` |
+| Outbound provider call | `provider_idem_key = payout:{transfer_id}` | `UNIQUE` on outbox; provider contract requires dedupe by client reference | Provider returns the original result |
+| Webhook delivery | `(provider, event_id)` | `PK` insert-first; HMAC over raw body + timestamp tolerance | Duplicate → no-op; replayed/stale → rejected |
+| Ledger posting per business step | `(transfer_id, transaction type)` | Partial `UNIQUE` on `ledger_transactions` | A retried worker cannot double-post fees or confirmations |
+| Route firing | `(route_id, trigger_transfer_id)` | `UNIQUE` on `route_executions` | A redelivered "deposit confirmed" event cannot fire the route twice |
+
+Webhooks are hostile input: signature verified over the raw body, timestamp window against replays, keyed dedupe against duplicates, and **monotonic state machines** against disorder — a `settled` can't regress to `processing`; a late event for a superseded state is recorded and ignored. Exactly-once between systems doesn't exist; what this section builds is at-least-once delivery + keyed dedupe at every receiver + reconciliation as the backstop — which converges to the same observable result.
+
+## 9. Reconciliation as a query
+
+Because the ledger is append-only and every ledger transaction carries an `external_ref`, end-of-day reconciliation is not a process — it's two anti-joins over facts. External truth (chain scans, provider statements via `getPayout`/statement endpoints) is ingested into an `external_truth` table (also append-only; recon *never* mutates the ledger):
+
+Refs are only unique *per source* (AcmePay and LegacyBank can emit colliding ids; a deposit's grain is `tx_hash:instruction_index`), so every join is on the pair `(source, id)`:
+
+**Mismatch type 1 — settled-with-no-entry** (the world moved money we didn't record: a missed deposit, a webhook that never arrived, the C3 window's far side):
+
+```sql
+SELECT e.source, e.external_id, e.amount_minor
+FROM   external_truth e
+LEFT   JOIN ledger_transactions lt
+       ON (lt.external_source, lt.external_ref) = (e.source, e.external_id)
+WHERE  lt.id IS NULL
+  AND  e.observed_at <= :cutoff;
+```
+
+**Mismatch type 2 — entry-never-confirmed** (we recorded intent that, past its rail's SLA, has no matching external fact — the C2/C4 windows, a broadcast tx that never landed). A true anti-join in the other direction, not just an age heuristic — a late-arriving statement row must *clear* the transfer, not leave it flagged:
+
+```sql
+SELECT DISTINCT t.id, t.status, now() - t.created_at AS age
+FROM   transfers t
+JOIN   ledger_transactions lt ON lt.transfer_id = t.id
+                             AND lt.type IN ('payout_submitted', 'deposit_detected')
+LEFT   JOIN external_truth e
+       ON (e.source, e.external_id) = (lt.external_source, lt.external_ref)
+WHERE  e.id IS NULL
+  AND  t.status IN ('submitted', 'pending_settlement')
+  AND  now() - t.created_at > :sla_for(t.rail);
+```
+
+A statement row that *does* match a still-pending transfer is not a mismatch at all — it's a late confirmation: recon feeds it down the same DomainEvent path a webhook would take, and the transfer settles normally.
+
+— equivalently visible as any **aged balance in a transit account**, which is why those accounts exist (§4.1). Three cheap integrity checks ride along: **solvency** (Σ client liabilities ≤ Σ mirror assets, per asset), **guard honesty** (`spend_guards.headroom == SUM(entries)` per account), and **conversion closure** (aged nonzero `conversion:*` pairs = ramps stuck mid-flight). Findings land as rows in `recon_exceptions` (append-only, with resolution state); corrections are always *new compensating entries* against a suspense account — reconciliation reports, it never edits. Because nothing is ever mutated, the same queries answer "did we balance *yesterday at 23:59*?" with a `WHERE created_at <= :t` — try that with mutated balances.
+
+## 10. Named trade-offs
+
+The calls I'm making, what I rejected, and the cost I'm knowingly accepting (each has a full ADR):
+
+| Call | Rejected alternative | Accepted cost | ADR |
+|---|---|---|---|
+| Modular monolith, Postgres as coordinator | Microservices, brokers, Redis | No independent scaling; single DB is the bottleneck (fine at this volume) | 001 |
+| `BIGINT` minor units + per-asset registry | `NUMERIC` everywhere; universal micro-USD unit | Must switch raw column to `NUMERIC(38,0)` the day an 18-decimal asset lands | 002 |
+| USD client books from entry one; native units on mirrors only | Token-denominated client claims until off-ramp | Peg assumed at booking time (funds are unspendable pending, so no spendable-rate risk) | 003 |
+| Guard row + `CHECK (≥ 0)` for no-negatives | `FOR UPDATE` + re-SUM; SERIALIZABLE + retries | Payouts serialize per account; guard must be provably rebuildable | 004 |
+| Fees at ramps, per-rail schedule (ACH configured at 0) | Fee on every hop | Must defend the asymmetry commercially; one config row flips it | 005 |
+| Credit available at chain confirmation | Credit only at off-ramp settlement | Kira lends the float; exposure = aged transit, capped and observable | 007 |
+| Outbox, ledger-first, query-before-retry | Provider-first; 2PC (doesn't exist over HTTP); saga without persisted intent | A dispatcher loop + recovery sweep to build and test | 012 |
+| Routes all-or-nothing, no partials | Priority/partial fills | A route can stall on insufficient funds (visible, retryable state) | 013 |
+| Polling watchers + simulator behind one port | WebSocket subscriptions | Seconds of latency; two implementations to keep honest via contract tests | 014 |
+| TypeScript + Postgres + Railway | Go/Python; fancier infra | Single-language leverage over raw runtime performance | 015 |
+
+## 11. What I'm deliberately not doing (and why)
 
 - **No Kafka/Redis/microservices/event-sourcing framework** — the append-only ledger already *is* the event log; Postgres already gives transactional queues and locks. Complexity that doesn't buy correctness is scored against me — and against the system.
 - **No Tron, Wire, SWIFT, FedNow implementations** — the required flow uses Solana, Polygon, ACH. The ports make the rest adapters, and the design names the seam; that's enough.
