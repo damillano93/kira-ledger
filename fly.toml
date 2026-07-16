@@ -20,6 +20,13 @@ primary_region = "iad"
   # Built from the Dockerfile at the repo root (owned by the app agent).
   dockerfile = "Dockerfile"
 
+[deploy]
+  # Run DB migrations ONCE per release on a single ephemeral machine, before the
+  # new version goes live — not per-machine on every boot. Running migrations in
+  # the container entrypoint races when 2+ machines restart together (concurrent
+  # DDL locks -> "Connection terminated"), which crash-loops the app.
+  release_command = "npx tsx scripts/migrate.ts"
+
 [env]
   # Non-secret defaults. Secrets (DATABASE_URL, API_KEY, WEBHOOK_SECRET,
   # CONFIRMATIONS) are set with `fly secrets set` — never committed here.

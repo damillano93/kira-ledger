@@ -22,5 +22,6 @@ COPY scripts ./scripts
 COPY src ./src
 COPY migrations ./migrations
 EXPOSE 3000
-# Run migrations, then start the server.
-CMD ["sh", "-c", "npx tsx scripts/migrate.ts && node dist/src/server.js"]
+# Start the server only. Migrations run once per release via the fly.toml
+# `release_command`, so machines never race to migrate on boot.
+CMD ["node", "dist/src/server.js"]
