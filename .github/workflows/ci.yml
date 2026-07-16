@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_prod:
+        description: "Deploy to PRODUCTION after tests pass"
+        type: boolean
+        default: false
+
+jobs:
+  # Always run on every push and PR: install, typecheck, test.
+  build-test:
+    name: Install / Typecheck / Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test
+
+  # Auto-deploy to STAGING only on push to main, and only if build-test passed.
+  deploy-staging:
+    name: Deploy to staging (Fly.io)
+    needs: build-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    concurrency: deploy-staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to staging
+        run: flyctl deploy --app kira-ledger-staging --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  # PROD is intentionally NOT auto-deployed.
+  #
+  # Why: prod carries real money-movement state (ledger balances, webhooks,
+  # confirmations). A green build on main is necessary but not sufficient to
+  # release to prod — we want a human to (a) verify the change on the live
+  # staging URL first, and (b) explicitly choose the release moment.
+  #
+  # This job runs prod deploy ONLY when triggered manually from the Actions tab
+  # (workflow_dispatch with deploy_prod=true). It is the "gate". You can also
+  # deploy prod straight from a laptop: `fly deploy --app kira-ledger-prod`.
+  deploy-prod:
+    name: Deploy to prod (manual gate)
+    needs: build-test
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_prod == true
+    runs-on: ubuntu-latest
+    concurrency: deploy-prod
+    environment: production   # add required reviewers on this GitHub Environment
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to prod
+        run: flyctl deploy --app kira-ledger-prod --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+# Enables the manual prod gate above from the GitHub Actions UI.
