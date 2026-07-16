@@ -4,6 +4,7 @@ import { withTx } from '../db.js';
 import { docRouteOptions, payoutSchema } from '../docs/openapi.js';
 import { createPayout, InsufficientFundsError } from '../domain/ledger.js';
 import { requireApiKey } from '../middleware/auth.js';
+import { emitLedgerEvent } from '../observability/events.js';
 
 // Outbound payout endpoint. Authenticated, zod-validated, and idempotent via the
 // `idempotency-key` request header (same key => same payout, never a double-spend).
@@ -42,6 +43,17 @@ export async function registerTransferRoutes(app: FastifyInstance): Promise<void
             currency: body.currency,
           }),
         );
+
+        if (result.created) {
+          emitLedgerEvent(request.log, {
+            type: 'money.payout.initiated',
+            transferId: result.transfer.id,
+            accountId: body.userAccountId,
+            destinationAccountId: body.destinationAccountId,
+            amountMinor: body.amount,
+            currency: body.currency,
+          });
+        }
 
         return reply.code(result.created ? 201 : 200).send({
           transferId: result.transfer.id,

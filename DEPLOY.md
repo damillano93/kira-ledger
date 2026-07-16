@@ -75,6 +75,27 @@ fly secrets set \
 > `DATABASE_URL` is already set by `fly postgres attach` (step 1b) — do not set
 > it again here unless you are using the Supabase/Neon fallback.
 
+### 1c-bis. Optional: enable the Solana devnet chain watcher
+
+The watcher is **off by default** (`ENABLE_CHAIN_WATCHER=false`) and the app
+boots with no chain dependency. To run the real devnet leg on a Fly app, first
+provision devnet locally (`npx tsx scripts/devnet-setup.ts` prints these
+values), then:
+
+```bash
+fly secrets set \
+  ENABLE_CHAIN_WATCHER="true" \
+  SOLANA_USDC_MINT="<mint printed by devnet-setup>" \
+  SOLANA_DEPOSIT_OWNER="<deposit owner printed by devnet-setup>" \
+  SOLANA_RPC_URL="https://api.devnet.solana.com" \
+  --app kira-ledger-staging
+```
+
+Optional tuning (defaults are fine): `WATCHER_POLL_MS=15000`,
+`OFFRAMP_FEE_BPS=100`. To watch Circle's devnet USDC instead of the test mint,
+set `SOLANA_USDC_MINT=4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` — config,
+not code.
+
 ### 1d. Deploy
 
 ```bash

@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .env
+.devnet/
 *.log
 npm-debug.log*
 .DS_Store

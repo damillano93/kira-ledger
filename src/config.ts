@@ -8,6 +8,26 @@ const schema = z.object({
   // Confirmations required before a deposit off-ramps (pending -> available).
   CONFIRMATIONS: z.coerce.number().int().positive().default(12),
   PORT: z.coerce.number().int().positive().default(3000),
+
+  // --- Chain watcher (Solana devnet) -----------------------------------------
+  // All optional with defaults so the current boot path is unchanged; the
+  // watcher only starts when ENABLE_CHAIN_WATCHER=true is set explicitly.
+  SOLANA_RPC_URL: z.string().default('https://api.devnet.solana.com'),
+  // SPL mint watched for deposits. Vendor abstraction as config: point this at
+  // our own 6dp test mint (scripts/devnet-setup.ts) or at Circle's devnet USDC
+  // (4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU) — no code change either way.
+  SOLANA_USDC_MINT: z.string().default(''),
+  // Wallet (owner) whose associated token account receives client deposits.
+  SOLANA_DEPOSIT_OWNER: z.string().default(''),
+  // Off by default: an env without Solana config must boot exactly as before.
+  // z.coerce.boolean() would treat the string 'false' as true, hence the transform.
+  ENABLE_CHAIN_WATCHER: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true' || v === '1'),
+  WATCHER_POLL_MS: z.coerce.number().int().positive().default(15_000),
+  // Off-ramp fee in basis points taken on the USD leg (100 = 1%).
+  OFFRAMP_FEE_BPS: z.coerce.number().int().min(0).max(10_000).default(100),
 });
 
 export type Config = z.infer<typeof schema>;
