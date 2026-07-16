@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { pool } from '../db.js';
+import { balanceSchema, docRouteOptions } from '../docs/openapi.js';
 
 const paramsSchema = z.object({ id: z.string().uuid() });
 
@@ -12,7 +13,10 @@ interface BalanceRow {
 }
 
 export async function registerAccountRoutes(app: FastifyInstance): Promise<void> {
-  app.get('/accounts/:id/balance', async (request: FastifyRequest, reply: FastifyReply) => {
+  app.get(
+    '/accounts/:id/balance',
+    { schema: balanceSchema, ...docRouteOptions },
+    async (request: FastifyRequest, reply: FastifyReply) => {
     const parsed = paramsSchema.safeParse(request.params);
     if (!parsed.success) {
       return reply.code(400).send({ error: 'invalid account id' });
@@ -39,5 +43,6 @@ export async function registerAccountRoutes(app: FastifyInstance): Promise<void>
       pending: row.pending,
       updatedAt: row.updated_at,
     });
-  });
+    },
+  );
 }

@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { withTx } from '../db.js';
+import { docRouteOptions, payoutSchema } from '../docs/openapi.js';
 import { createPayout, InsufficientFundsError } from '../domain/ledger.js';
 import { requireApiKey } from '../middleware/auth.js';
 
@@ -18,7 +19,7 @@ const bodySchema = z.object({
 export async function registerTransferRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/transfers/payout',
-    { preHandler: requireApiKey },
+    { preHandler: requireApiKey, schema: payoutSchema, ...docRouteOptions },
     async (request: FastifyRequest, reply: FastifyReply) => {
       const idempotencyKey = request.headers['idempotency-key'];
       if (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0) {

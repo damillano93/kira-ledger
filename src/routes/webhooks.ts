@@ -3,6 +3,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { config } from '../config.js';
 import { withTx } from '../db.js';
+import { docRouteOptions, webhookSchema } from '../docs/openapi.js';
 import { recordDeposit } from '../domain/offramp.js';
 
 // Inbound chain webhook. Body carries a detected on-chain deposit. Security:
@@ -39,7 +40,10 @@ function timestampFresh(raw: string | undefined): boolean {
 }
 
 export async function registerWebhookRoutes(app: FastifyInstance): Promise<void> {
-  app.post('/webhooks/chain', async (request: FastifyRequest, reply: FastifyReply) => {
+  app.post(
+    '/webhooks/chain',
+    { schema: webhookSchema, ...docRouteOptions },
+    async (request: FastifyRequest, reply: FastifyReply) => {
     // rawBody is captured by the content-type parser registered in server.ts.
     const rawBody = (request as FastifyRequest & { rawBody?: string }).rawBody ?? '';
 
@@ -75,5 +79,6 @@ export async function registerWebhookRoutes(app: FastifyInstance): Promise<void>
       status: result.transfer.status,
       idempotent: !result.created,
     });
-  });
+    },
+  );
 }
