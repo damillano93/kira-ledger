@@ -1,0 +1,63 @@
+# fly.toml — shared Fly.io config for the kira-ledger Fastify service.
+#
+# ONE config, TWO apps. We do NOT keep separate staging/prod TOML files.
+# The app name is chosen at deploy time with the `--app` flag:
+#
+#   Staging:  fly deploy --app kira-ledger-staging
+#   Prod:     fly deploy --app kira-ledger-prod
+#
+# Rationale: the runtime shape (Node 20, port 3000, health checks) is identical
+# across environments. Only per-app values (secrets, DATABASE_URL, scaling)
+# differ, and those live in Fly app config / secrets, not in this file. This
+# avoids config drift between two near-duplicate TOMLs. See DEPLOY.md.
+#
+# `app` below is a default; `--app <name>` on the CLI always overrides it.
+
+app = "kira-ledger-staging"
+primary_region = "iad"
+
+[build]
+  # Built from the Dockerfile at the repo root (owned by the app agent).
+  dockerfile = "Dockerfile"
+
+[deploy]
+  # Run DB migrations ONCE per release on a single ephemeral machine, before the
+  # new version goes live — not per-machine on every boot. Running migrations in
+  # the container entrypoint races when 2+ machines restart together (concurrent
+  # DDL locks -> "Connection terminated"), which crash-loops the app.
+  release_command = "npx tsx scripts/migrate.ts"
+
+[env]
+  # Non-secret defaults. Secrets (DATABASE_URL, API_KEY, WEBHOOK_SECRET,
+  # CONFIRMATIONS) are set with `fly secrets set` — never committed here.
+  NODE_ENV = "production"
+  PORT = "3000"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  # Keep at least 1 machine warm so the public URL and health checks stay live.
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    # Liveness — is the process up and serving HTTP?
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/healthz"
+
+  [[http_service.checks]]
+    # Readiness — is the app ready to take traffic (e.g. DB reachable)?
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/readyz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
