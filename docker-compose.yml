@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: kira
+      POSTGRES_PASSWORD: kira
+      POSTGRES_DB: kira
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kira -d kira"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - kira_pgdata:/var/lib/postgresql/data
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://kira:kira@db:5432/kira
+      API_KEY: dev-api-key-change-me
+      WEBHOOK_SECRET: dev-webhook-secret-change-me
+      CONFIRMATIONS: "12"
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+
+volumes:
+  kira_pgdata:
