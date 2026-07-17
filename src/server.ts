@@ -1,8 +1,9 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import fastifySwagger from '@fastify/swagger';
 import fastifySwaggerUi from '@fastify/swagger-ui';
+import { setOnOfframpConfirmed, startChainWatcher } from './chain/index.js';
 import { config } from './config.js';
-import { ping } from './db.js';
+import { ping, withTx } from './db.js';
 import {
   docRouteOptions,
   healthzSchema,
@@ -10,8 +11,13 @@ import {
   readyzSchema,
 } from './docs/openapi.js';
 import { registerAccountRoutes } from './routes/accounts.js';
+import { registerDashboardRoutes } from './routes/dashboard.js';
+import { registerReconRoutes } from './routes/recon.js';
+import { registerRoutingRoutes, registerMockProviderRoutes } from './routes/routing.js';
 import { registerTransferRoutes } from './routes/transfers.js';
 import { registerWebhookRoutes } from './routes/webhooks.js';
+import { dispatchExecution, onOfframpConfirmed } from './routing/engine.js';
+import { defaultRegistry } from './vendors/registry.js';
 
 export async function buildServer() {
   const app = Fastify({ logger: true });
@@ -69,6 +75,40 @@ export async function buildServer() {
   await registerWebhookRoutes(app);
   await registerTransferRoutes(app);
   await registerAccountRoutes(app);
+  await registerDashboardRoutes(app);
+  await registerRoutingRoutes(app);
+  await registerMockProviderRoutes(app);
+  await registerReconRoutes(app);
+
+  // Chain watcher wiring — only when explicitly enabled (default false: an env
+  // without Solana config must boot exactly as before).
+  //
+  // Contract bridge, watcher -> routing: the watcher fires its hook AFTER the
+  // credit transaction commits (a routing failure must never roll back a
+  // durable credit), while the engine's onOfframpConfirmed reserves inside a
+  // caller-provided transaction. So the bridge opens a NEW transaction for the
+  // reservation (all-or-nothing, same as POST /routing/trigger) and dispatches
+  // providers only AFTER that commit — never provider I/O inside a DB
+  // transaction. A redelivered confirmation is absorbed by the engine's
+  // UNIQUE(route_id, trigger_transfer_id) guardrail (R4), so at-least-once
+  // delivery here is safe.
+  if (config.ENABLE_CHAIN_WATCHER) {
+    setOnOfframpConfirmed(async (event) => {
+      const triggered = await withTx((client) =>
+        onOfframpConfirmed(client, event.offrampTransferId, event.userAccountId, app.log),
+      );
+      for (const execution of triggered) {
+        if (execution.status === 'reserved') {
+          await dispatchExecution(execution.executionId, defaultRegistry, app.log);
+        }
+      }
+    });
+    const watcher = startChainWatcher({ logger: app.log, events: app.log });
+    app.addHook('onClose', async () => {
+      watcher.stop();
+      setOnOfframpConfirmed(null);
+    });
+  }
 
   return app;
 }

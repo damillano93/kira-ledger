@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { withTx } from '../db.js';
 import { docRouteOptions, webhookSchema } from '../docs/openapi.js';
 import { recordDeposit } from '../domain/offramp.js';
+import { emitLedgerEvent } from '../observability/events.js';
 
 // Inbound chain webhook. Body carries a detected on-chain deposit. Security:
 //   * HMAC-SHA256(WEBHOOK_SECRET, rawBody) must match the `x-signature` header.
@@ -47,10 +48,21 @@ export async function registerWebhookRoutes(app: FastifyInstance): Promise<void>
     // rawBody is captured by the content-type parser registered in server.ts.
     const rawBody = (request as FastifyRequest & { rawBody?: string }).rawBody ?? '';
 
-    if (!timestampFresh(request.headers['x-timestamp'] as string | undefined)) {
+    const timestampHeader = request.headers['x-timestamp'] as string | undefined;
+    if (!timestampFresh(timestampHeader)) {
+      emitLedgerEvent(request.log, {
+        type: 'provider.webhook.rejected',
+        provider: 'chain',
+        reason: timestampHeader === undefined ? 'missing_timestamp' : 'stale_timestamp',
+      });
       return reply.code(401).send({ error: 'stale or missing timestamp' });
     }
     if (!verifySignature(rawBody, request.headers['x-signature'] as string | undefined)) {
+      emitLedgerEvent(request.log, {
+        type: 'provider.webhook.rejected',
+        provider: 'chain',
+        reason: 'bad_signature',
+      });
       return reply.code(401).send({ error: 'invalid signature' });
     }
 
